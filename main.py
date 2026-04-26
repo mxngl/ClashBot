@@ -293,13 +293,16 @@ async def get_valid_access_token() -> str:
     return access_token
 
 
-async def aps_get_issues(project_id: str, limit: int = 50):
+async def aps_get_issues(project_id: str, limit: int = 50, status_filter: str | None = None):
     token = await get_valid_access_token()
+    params: dict = {"limit": limit}
+    if status_filter:
+        params["filter[status]"] = status_filter
     async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
         resp = await client.get(
             f"{APS_ISSUES_BASE}/projects/{project_id}/issues",
             headers={"Authorization": f"Bearer {token}"},
-            params={"limit": limit},
+            params=params,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -563,65 +566,64 @@ async def acc_projects(interaction: discord.Interaction, hub_id: str = None):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@tree.command(name="clashes", description="List ACC Issues (Resolve annotations).")
-@app_commands.guilds(GUILD)
-@app_commands.choices(mode=MODE_CHOICES)
-async def clashes(
-    interaction: discord.Interaction,
-    mode: app_commands.Choice[str] = None,
-    limit: int = 10,
-):
-    project_id = db_get_setting("APS_PROJECT_ID_ISSUES")
-    if not project_id:
-        await interaction.response.send_message(
-            "⚠️ No project id set. Put APS_PROJECT_ID_ISSUES into your .env.",
-            ephemeral=True,
-        )
-        return
+def _is_closed(status: str | None) -> bool:
+    return (status or "").lower() in ["closed", "resolved"]
 
-    mode_value = mode.value if mode else "all"
-    limit = max(1, min(limit, 20))
 
-    await interaction.response.defer(ephemeral=False)
+async def _load_issues_for_mode(
+    project_id: str, mode_value: str, my_issue_ids: set[str]
+) -> list[dict]:
+    """Fetch and filter issues for the given mode.
 
-    try:
-        issues = await asyncio.wait_for(aps_get_issues(project_id, limit=200), timeout=25)
-    except asyncio.TimeoutError:
-        await interaction.followup.send("⚠️ APS request timed out (>25s). Try again.", ephemeral=True)
-        return
-    except Exception as e:
-        await interaction.followup.send(f"⚠️ Failed to fetch issues: `{e}`", ephemeral=True)
-        return
-
-    # Backward-compatible: older DB rows may have stored str(interaction.user)
-    my_issue_ids = (
-        db_list_issues_added_by(str(interaction.user.id))
-        | db_list_issues_added_by(str(interaction.user))
-    )
-
-    def is_closed(s):
-        return (s or "").lower() in ["closed", "resolved"]
-
+    - closed: server-side filter, no post-processing needed
+    - my:     fetch only locally tracked IDs in parallel, filter out closed
+    - all:    fetch a generous batch, filter out closed client-side
+    """
     if mode_value == "closed":
-        issues = [i for i in issues if is_closed(i.get("status"))]
-    elif mode_value == "my":
-        issues = [i for i in issues if not is_closed(i.get("status")) and str(i.get("id")) in my_issue_ids]
-    else:
-        issues = [i for i in issues if not is_closed(i.get("status"))]
+        return await asyncio.wait_for(
+            aps_get_issues(project_id, limit=100, status_filter="closed"),
+            timeout=25,
+        )
 
-    if not issues:
-        await interaction.followup.send(f"No issues found for mode **{mode_value}**.")
-        return
+    if mode_value == "my":
+        if not my_issue_ids:
+            return []
 
-    embed = discord.Embed(title=f"ACC Issues — {mode_value.upper()}")
+        async def _safe_fetch(issue_id: str) -> dict | None:
+            try:
+                return await asyncio.wait_for(aps_get_issue(project_id, issue_id), timeout=10)
+            except Exception as e:
+                log.warning("Could not fetch issue %s: %s", issue_id, e)
+                return None
 
-    for it in issues[:limit]:
+        results = await asyncio.gather(*[_safe_fetch(iid) for iid in my_issue_ids])
+        return [r for r in results if isinstance(r, dict) and not _is_closed(r.get("status"))]
+
+    # mode: all — fetch open issues
+    issues = await asyncio.wait_for(
+        aps_get_issues(project_id, limit=100),
+        timeout=25,
+    )
+    return [i for i in issues if not _is_closed(i.get("status"))]
+
+
+def _build_clashes_embed(
+    issues: list[dict], page: int, per_page: int, mode_value: str,
+    project_id: str, channel_id: str,
+) -> discord.Embed:
+    total_pages = max(1, (len(issues) + per_page - 1) // per_page)
+    page_issues = issues[page * per_page : (page + 1) * per_page]
+
+    embed = discord.Embed(
+        title=f"ACC Issues — {mode_value.upper()}",
+        description=f"Seite {page + 1}/{total_pages} · {len(issues)} Issues gesamt",
+    )
+    for it in page_issues:
         issue_id = str(it.get("id"))
         title = it.get("title") or "Untitled"
         status = it.get("status") or "—"
-        added_by = db_get_channel_issue_added_by(str(interaction.channel_id), issue_id)
+        added_by = db_get_channel_issue_added_by(channel_id, issue_id)
         assignee = f"<@{added_by}>" if added_by else "—"
-
         embed.add_field(
             name=str(title)[:80],
             value=(
@@ -632,8 +634,100 @@ async def clashes(
             ),
             inline=False,
         )
+    return embed
 
-    await interaction.followup.send(embed=embed)
+
+class ClashesView(discord.ui.View):
+    def __init__(
+        self,
+        issues: list[dict],
+        per_page: int,
+        mode_value: str,
+        project_id: str,
+        channel_id: str,
+    ):
+        super().__init__(timeout=300)
+        self.issues = issues
+        self.per_page = per_page
+        self.mode_value = mode_value
+        self.project_id = project_id
+        self.channel_id = channel_id
+        self.page = 0
+        self._sync_buttons()
+
+    @property
+    def _total_pages(self) -> int:
+        return max(1, (len(self.issues) + self.per_page - 1) // self.per_page)
+
+    def _sync_buttons(self):
+        self.prev_btn.disabled = self.page == 0
+        self.next_btn.disabled = self.page >= self._total_pages - 1
+
+    def _embed(self) -> discord.Embed:
+        return _build_clashes_embed(
+            self.issues, self.page, self.per_page,
+            self.mode_value, self.project_id, self.channel_id,
+        )
+
+    @discord.ui.button(label="◀ Zurück", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        self.page -= 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self._embed(), view=self)
+
+    @discord.ui.button(label="Weiter ▶", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        self.page += 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self._embed(), view=self)
+
+    async def on_timeout(self):
+        self.prev_btn.disabled = True
+        self.next_btn.disabled = True
+
+
+@tree.command(name="clashes", description="List ACC Issues (Resolve annotations).")
+@app_commands.guilds(GUILD)
+@app_commands.choices(mode=MODE_CHOICES)
+async def clashes(
+    interaction: discord.Interaction,
+    mode: app_commands.Choice[str] = None,
+    per_page: int = 5,
+):
+    project_id = db_get_setting("APS_PROJECT_ID_ISSUES")
+    if not project_id:
+        await interaction.response.send_message(
+            "⚠️ No project id set. Put APS_PROJECT_ID_ISSUES into your .env.",
+            ephemeral=True,
+        )
+        return
+
+    mode_value = mode.value if mode else "all"
+    per_page = max(1, min(per_page, 10))
+
+    await interaction.response.defer(ephemeral=False)
+
+    # Backward-compatible: older DB rows may have stored str(interaction.user)
+    my_issue_ids = (
+        db_list_issues_added_by(str(interaction.user.id))
+        | db_list_issues_added_by(str(interaction.user))
+    )
+
+    try:
+        issues = await _load_issues_for_mode(project_id, mode_value, my_issue_ids)
+    except asyncio.TimeoutError:
+        await interaction.followup.send("⚠️ APS request timed out (>25s). Try again.", ephemeral=True)
+        return
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Failed to fetch issues: `{e}`", ephemeral=True)
+        return
+
+    if not issues:
+        await interaction.followup.send(f"Keine Issues gefunden für Modus **{mode_value}**.")
+        return
+
+    view = ClashesView(issues, per_page, mode_value, project_id, str(interaction.channel_id))
+    await interaction.followup.send(embed=view._embed(), view=view)
 
 
 @tree.command(name="clash_add", description="Save an ACC issue id to this channel's inbox.")

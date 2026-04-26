@@ -136,6 +136,19 @@ def db_init():
                 marker_z REAL,
                 imported_at INTEGER
             );
+
+            CREATE TABLE IF NOT EXISTS user_tokens (
+                discord_user_id TEXT PRIMARY KEY,
+                access_token TEXT,
+                refresh_token TEXT,
+                expires_at INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS issue_status_cache (
+                issue_id TEXT PRIMARY KEY,
+                last_status TEXT,
+                updated_at INTEGER
+            );
         """)
 
     if APS_PROJECT_ID_ISSUES_DEFAULT and not db_get_setting("APS_PROJECT_ID_ISSUES"):
@@ -222,6 +235,62 @@ def db_list_issues_added_by(added_by: str) -> set:
             (str(added_by),),
         ).fetchall()
     return {r[0] for r in rows}
+
+
+def db_set_user_token(discord_user_id: str, access_token: str, refresh_token: str, expires_at: int):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO user_tokens (discord_user_id, access_token, refresh_token, expires_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(discord_user_id) DO UPDATE SET "
+            "access_token=excluded.access_token, refresh_token=excluded.refresh_token, "
+            "expires_at=excluded.expires_at",
+            (str(discord_user_id), access_token, refresh_token, int(expires_at)),
+        )
+
+
+def db_get_user_token(discord_user_id: str) -> dict | None:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT access_token, refresh_token, expires_at FROM user_tokens WHERE discord_user_id = ?",
+            (str(discord_user_id),),
+        ).fetchone()
+    if not row:
+        return None
+    return {"access_token": row[0], "refresh_token": row[1], "expires_at": int(row[2])}
+
+
+def db_get_any_user_token_id() -> str | None:
+    """Return the discord_user_id of any user who has a stored token."""
+    with get_db() as conn:
+        row = conn.execute("SELECT discord_user_id FROM user_tokens LIMIT 1").fetchone()
+    return row[0] if row else None
+
+
+def db_get_all_tracked_issues() -> dict[str, list[str]]:
+    """Return {issue_id: [channel_id, ...]} for every tracked issue."""
+    with get_db() as conn:
+        rows = conn.execute("SELECT issue_id, channel_id FROM channel_issues").fetchall()
+    result: dict[str, list[str]] = {}
+    for issue_id, channel_id in rows:
+        result.setdefault(issue_id, []).append(channel_id)
+    return result
+
+
+def db_get_cached_status(issue_id: str) -> str | None:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT last_status FROM issue_status_cache WHERE issue_id = ?", (issue_id,)
+        ).fetchone()
+    return row[0] if row else None
+
+
+def db_set_cached_status(issue_id: str, status: str):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO issue_status_cache (issue_id, last_status, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(issue_id) DO UPDATE SET last_status=excluded.last_status, updated_at=excluded.updated_at",
+            (issue_id, status, int(time.time())),
+        )
 
 
 def db_upsert_csv_issues(rows: list[dict]) -> int:
@@ -354,12 +423,31 @@ async def aps_refresh_token(refresh_token: str):
         return resp.json()
 
 
-async def get_valid_access_token() -> str:
-    tok = db_get_tokens()
-    if not tok:
+async def get_valid_access_token(discord_user_id: str | None = None) -> str:
+    """Return a valid access token.
+
+    Tries in order: user-specific token → any stored user token → legacy global token.
+    Refreshes automatically and persists the new token.
+    """
+    now = int(time.time())
+
+    def _pick_tok() -> tuple[dict, str | None]:
+        if discord_user_id:
+            t = db_get_user_token(discord_user_id)
+            if t:
+                return t, discord_user_id
+        any_uid = db_get_any_user_token_id()
+        if any_uid:
+            t = db_get_user_token(any_uid)
+            if t:
+                return t, any_uid
+        t = db_get_tokens()
+        if t:
+            return t, None
         raise RuntimeError("Not linked to ACC yet. Run /link-acc.")
 
-    now = int(time.time())
+    tok, owner_id = _pick_tok()
+
     if tok["expires_at"] > now + 30:
         return tok["access_token"]
 
@@ -368,7 +456,7 @@ async def get_valid_access_token() -> str:
     except httpx.HTTPStatusError as e:
         if e.response is not None and e.response.status_code == 400:
             raise RuntimeError(
-                "Your ACC connection needs to be refreshed. Please run /link-acc again to re-authorize the bot."
+                "Your ACC connection needs to be refreshed. Please run /link-acc again."
             ) from e
         raise
 
@@ -376,12 +464,19 @@ async def get_valid_access_token() -> str:
     refresh_token = refreshed.get("refresh_token", tok["refresh_token"])
     expires_at = now + int(refreshed.get("expires_in", 3600))
 
-    db_set_tokens(access_token, refresh_token, expires_at)
+    if owner_id:
+        db_set_user_token(owner_id, access_token, refresh_token, expires_at)
+    else:
+        db_set_tokens(access_token, refresh_token, expires_at)
+
     return access_token
 
 
-async def aps_get_issues(project_id: str, limit: int = 50, status_filter: str | None = None):
-    token = await get_valid_access_token()
+async def aps_get_issues(
+    project_id: str, limit: int = 50, status_filter: str | None = None,
+    discord_user_id: str | None = None,
+):
+    token = await get_valid_access_token(discord_user_id)
     params: dict = {"limit": limit}
     if status_filter:
         params["filter[status]"] = status_filter
@@ -396,8 +491,8 @@ async def aps_get_issues(project_id: str, limit: int = 50, status_filter: str | 
         return data.get("results", data.get("data", []))
 
 
-async def aps_get_issue(project_id: str, issue_id: str):
-    token = await get_valid_access_token()
+async def aps_get_issue(project_id: str, issue_id: str, discord_user_id: str | None = None):
+    token = await get_valid_access_token(discord_user_id)
     async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
         resp = await client.get(
             f"{APS_ISSUES_BASE}/projects/{project_id}/issues/{issue_id}",
@@ -407,8 +502,8 @@ async def aps_get_issue(project_id: str, issue_id: str):
         return resp.json()
 
 
-async def aps_get_hubs():
-    token = await get_valid_access_token()
+async def aps_get_hubs(discord_user_id: str | None = None):
+    token = await get_valid_access_token(discord_user_id)
     async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
         resp = await client.get(
             f"{APS_DM_BASE}/hubs",
@@ -418,8 +513,8 @@ async def aps_get_hubs():
         return resp.json().get("data", [])
 
 
-async def aps_get_projects(hub_id: str):
-    token = await get_valid_access_token()
+async def aps_get_projects(hub_id: str, discord_user_id: str | None = None):
+    token = await get_valid_access_token(discord_user_id)
     async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
         resp = await client.get(
             f"{APS_DM_BASE}/hubs/{hub_id}/projects",
@@ -465,13 +560,82 @@ async def oauth_callback(request: Request):
     log.info("OAuth tokens stored successfully.")
 
     discord_user_id = consume_oauth_state(state) if state else None
-    if discord_user_id and _main_loop:
-        asyncio.run_coroutine_threadsafe(
-            _notify_linked(discord_user_id),
-            _main_loop,
-        )
+    if discord_user_id:
+        db_set_user_token(discord_user_id, token["access_token"], token["refresh_token"], expires_at)
+        if _main_loop:
+            asyncio.run_coroutine_threadsafe(_notify_linked(discord_user_id), _main_loop)
+    else:
+        db_set_tokens(token["access_token"], token["refresh_token"], expires_at)
 
     return {"ok": True, "message": "ACC connected. You can close this tab."}
+
+
+# =========================================================
+# STATUS UPDATE BACKGROUND TASK
+# =========================================================
+
+STATUS_CHECK_INTERVAL = int(os.getenv("STATUS_CHECK_INTERVAL", "1800"))  # seconds, default 30 min
+
+
+async def _check_status_changes():
+    project_id = db_get_setting("APS_PROJECT_ID_ISSUES")
+    if not project_id:
+        return
+
+    all_tracked = db_get_all_tracked_issues()
+    # Only check APS issues (UUID-style IDs, not numeric CSV IDs)
+    aps_tracked = {iid: chs for iid, chs in all_tracked.items() if not iid.isdigit()}
+    if not aps_tracked:
+        return
+
+    log.info("Status check: %d tracked APS issues", len(aps_tracked))
+
+    async def _fetch_status(issue_id: str) -> tuple[str, str | None]:
+        try:
+            data = await asyncio.wait_for(aps_get_issue(project_id, issue_id), timeout=10)
+            return issue_id, data.get("status")
+        except Exception as e:
+            log.warning("Status check failed for %s: %s", issue_id, e)
+            return issue_id, None
+
+    results = await asyncio.gather(*[_fetch_status(iid) for iid in aps_tracked])
+
+    for issue_id, new_status in results:
+        if new_status is None:
+            continue
+        old_status = db_get_cached_status(issue_id)
+        db_set_cached_status(issue_id, new_status)
+
+        if old_status is not None and old_status != new_status:
+            log.info("Issue %s: %s → %s", issue_id, old_status, new_status)
+            for channel_id in aps_tracked[issue_id]:
+                channel = client.get_channel(int(channel_id))
+                if channel:
+                    with contextlib.suppress(Exception):
+                        embed = discord.Embed(
+                            title="🔔 Issue Status Changed",
+                            description=f"ID: `{issue_id}`",
+                            color=discord.Color.green() if _is_closed(new_status) else discord.Color.orange(),
+                        )
+                        embed.add_field(name="Before", value=f"`{old_status}`", inline=True)
+                        embed.add_field(name="After", value=f"`{new_status}`", inline=True)
+                        embed.add_field(
+                            name="View",
+                            value=f"[Open in ACC]({build_acc_issue_url(project_id, issue_id)})",
+                            inline=False,
+                        )
+                        await channel.send(embed=embed)
+
+
+async def _status_update_loop():
+    await client.wait_until_ready()
+    log.info("Status update loop started (interval: %ds)", STATUS_CHECK_INTERVAL)
+    while not client.is_closed():
+        await asyncio.sleep(STATUS_CHECK_INTERVAL)
+        try:
+            await _check_status_changes()
+        except Exception as e:
+            log.error("Status update loop error: %s", e)
 
 
 # =========================================================
@@ -499,6 +663,8 @@ class ClashBotClient(discord.Client):
             log.info("Synced %d commands to guild %d", len(synced), GUILD_ID)
         except Exception as e:
             log.error("Command sync failed: %s", e)
+
+        asyncio.create_task(_status_update_loop())
 
 
 client = ClashBotClient(intents=intents)
@@ -549,7 +715,8 @@ async def overview(interaction: discord.Interaction):
             "• /link-acc\n"
             "• /acc_hubs\n"
             "• /acc_projects [hub_id]\n"
-            "• /import_csv — Resolve CSV importieren\n"
+            "• /import_csv — import Resolve CSV\n"
+            "• /set_project project_id:<id>\n"
             "• /clashes mode:(all|closed|my) per_page:5\n"
             "• /clash_add issue_id:<id>\n"
             "• /clash_remove issue_id:<id>\n"
@@ -603,9 +770,9 @@ async def link_acc(interaction: discord.Interaction):
 @app_commands.guilds(GUILD)
 async def acc_hubs(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-
+    uid = str(interaction.user.id)
     try:
-        hubs = await asyncio.wait_for(aps_get_hubs(), timeout=25)
+        hubs = await asyncio.wait_for(aps_get_hubs(discord_user_id=uid), timeout=25)
     except Exception as e:
         await interaction.followup.send(f"⚠️ Failed to fetch hubs: `{e}`", ephemeral=True)
         return
@@ -627,16 +794,16 @@ async def acc_hubs(interaction: discord.Interaction):
 @app_commands.guilds(GUILD)
 async def acc_projects(interaction: discord.Interaction, hub_id: str = None):
     await interaction.response.defer(ephemeral=True)
-
+    uid = str(interaction.user.id)
     try:
         if not hub_id:
-            hubs = await asyncio.wait_for(aps_get_hubs(), timeout=25)
+            hubs = await asyncio.wait_for(aps_get_hubs(discord_user_id=uid), timeout=25)
             if not hubs:
                 await interaction.followup.send("No hubs found.", ephemeral=True)
                 return
             hub_id = hubs[0].get("id")
 
-        projects = await asyncio.wait_for(aps_get_projects(hub_id), timeout=25)
+        projects = await asyncio.wait_for(aps_get_projects(hub_id, discord_user_id=uid), timeout=25)
     except Exception as e:
         await interaction.followup.send(f"⚠️ Failed to fetch projects: `{e}`", ephemeral=True)
         return
@@ -652,6 +819,26 @@ async def acc_projects(interaction: discord.Interaction, hub_id: str = None):
         embed.add_field(name=str(name)[:80], value=f"ID: `{p.get('id')}`", inline=False)
 
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="set_project", description="Set the ACC project used by this server.")
+@app_commands.guilds(GUILD)
+async def set_project(interaction: discord.Interaction, project_id: str):
+    await interaction.response.defer(ephemeral=True)
+    uid = str(interaction.user.id)
+    try:
+        await asyncio.wait_for(
+            aps_get_issues(project_id.strip(), limit=1, discord_user_id=uid), timeout=15
+        )
+    except Exception as e:
+        await interaction.followup.send(
+            f"⚠️ Could not verify project `{project_id}`: `{e}`\n"
+            "Use `/acc_projects` to find valid project IDs.",
+            ephemeral=True,
+        )
+        return
+    db_set_setting("APS_PROJECT_ID_ISSUES", project_id.strip())
+    await interaction.followup.send(f"✅ Project set to `{project_id.strip()}`.", ephemeral=True)
 
 
 def _is_closed(status: str | None) -> bool:
@@ -684,14 +871,14 @@ def _merge_and_dedup(csv_issues: list[dict], aps_issues: list[dict]) -> list[dic
 
 
 async def _load_issues_for_mode(
-    project_id: str, mode_value: str, my_issue_ids: set[str]
+    project_id: str, mode_value: str, my_issue_ids: set[str], discord_user_id: str | None = None
 ) -> list[dict]:
     csv_all = db_get_csv_issues()
 
     if mode_value == "closed":
         csv_closed = [i for i in csv_all if _is_closed(i["status"])]
         aps_closed = await asyncio.wait_for(
-            aps_get_issues(project_id, limit=100, status_filter="closed"),
+            aps_get_issues(project_id, limit=100, status_filter="closed", discord_user_id=discord_user_id),
             timeout=25,
         )
         return _merge_and_dedup(csv_closed, aps_closed)
@@ -702,7 +889,9 @@ async def _load_issues_for_mode(
 
         async def _safe_fetch(issue_id: str) -> dict | None:
             try:
-                return await asyncio.wait_for(aps_get_issue(project_id, issue_id), timeout=10)
+                return await asyncio.wait_for(
+                    aps_get_issue(project_id, issue_id, discord_user_id=discord_user_id), timeout=10
+                )
             except Exception as e:
                 log.warning("Could not fetch issue %s: %s", issue_id, e)
                 return None
@@ -718,7 +907,7 @@ async def _load_issues_for_mode(
     # mode: all — open issues
     csv_open = [i for i in csv_all if not _is_closed(i["status"])]
     aps_all = await asyncio.wait_for(
-        aps_get_issues(project_id, limit=100),
+        aps_get_issues(project_id, limit=100, discord_user_id=discord_user_id),
         timeout=25,
     )
     aps_open = [i for i in aps_all if not _is_closed(i.get("status"))]
@@ -855,7 +1044,9 @@ async def clashes(
     )
 
     try:
-        issues = await _load_issues_for_mode(project_id, mode_value, my_issue_ids)
+        issues = await _load_issues_for_mode(
+            project_id, mode_value, my_issue_ids, discord_user_id=str(interaction.user.id)
+        )
     except asyncio.TimeoutError:
         await interaction.followup.send("⚠️ APS request timed out (>25s). Try again.", ephemeral=True)
         return
@@ -908,10 +1099,40 @@ async def _autocomplete_inbox_issues(
 @app_commands.guilds(GUILD)
 @app_commands.autocomplete(issue_id=_autocomplete_all_issues)
 async def clash_add(interaction: discord.Interaction, issue_id: str):
-    db_add_channel_issue(str(interaction.channel_id), issue_id.strip(), str(interaction.user.id))
-    await interaction.response.send_message(
-        f"✅ Issue `{issue_id.strip()}` added to this channel's inbox.",
-        ephemeral=True,
+    issue_id = issue_id.strip()
+    uid = str(interaction.user.id)
+
+    # CSV issues: validate instantly against local DB
+    csv_ids = {i["id"] for i in db_get_csv_issues()}
+    if issue_id in csv_ids:
+        db_add_channel_issue(str(interaction.channel_id), issue_id, uid)
+        await interaction.response.send_message(
+            f"✅ Issue `{issue_id}` added to this channel's inbox.", ephemeral=True
+        )
+        return
+
+    # APS issues: validate against API
+    project_id = db_get_setting("APS_PROJECT_ID_ISSUES")
+    if not project_id:
+        # No project configured — store without validation
+        db_add_channel_issue(str(interaction.channel_id), issue_id, uid)
+        await interaction.response.send_message(
+            f"✅ Issue `{issue_id}` added (unvalidated — no project set).", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await asyncio.wait_for(aps_get_issue(project_id, issue_id, discord_user_id=uid), timeout=10)
+    except Exception:
+        await interaction.followup.send(
+            f"⚠️ Issue `{issue_id}` not found in ACC. Check the ID and try again.", ephemeral=True
+        )
+        return
+
+    db_add_channel_issue(str(interaction.channel_id), issue_id, uid)
+    await interaction.followup.send(
+        f"✅ Issue `{issue_id}` added to this channel's inbox.", ephemeral=True
     )
 
 
@@ -947,9 +1168,14 @@ async def inbox(interaction: discord.Interaction, limit: int = 10):
 
     rows = rows[:limit]
 
+    uid = str(interaction.user.id)
+
     async def fetch_issue(issue_id: str):
+        if issue_id.isdigit():
+            csv_by_id = {i["id"]: i for i in db_get_csv_issues()}
+            return csv_by_id.get(issue_id)
         try:
-            return await asyncio.wait_for(aps_get_issue(project_id, issue_id), timeout=10)
+            return await asyncio.wait_for(aps_get_issue(project_id, issue_id, discord_user_id=uid), timeout=10)
         except Exception as e:
             log.warning("Could not fetch issue %s: %s", issue_id, e)
             return None

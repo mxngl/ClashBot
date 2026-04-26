@@ -445,8 +445,8 @@ async def _notify_linked(discord_user_id: str) -> None:
     try:
         user = await client.fetch_user(int(discord_user_id))
         await user.send(
-            "✅ **ACC erfolgreich verbunden!**\n"
-            "Du kannst den Bot jetzt mit `/clashes`, `/inbox` und `/clash_add` nutzen."
+            "✅ **ACC connected successfully!**\n"
+            "You can now use `/clashes`, `/inbox` and `/clash_add`."
         )
     except Exception as e:
         log.warning("Could not DM user %s after OAuth: %s", discord_user_id, e)
@@ -590,9 +590,9 @@ async def link_acc(interaction: discord.Interaction):
     embed = discord.Embed(
         title="Connect Autodesk ACC",
         description=(
-            "Klick den Button unten um dich mit deinem Autodesk-Konto zu verbinden.\n\n"
-            "Nach dem Login bekommst du eine DM von mir zur Bestätigung.\n"
-            "Der Link ist **10 Minuten** gültig."
+            "Click the button below to connect your Autodesk account.\n\n"
+            "After login you'll receive a DM from me confirming the connection.\n"
+            "The link is valid for **10 minutes**."
         ),
         color=discord.Color.orange(),
     )
@@ -741,7 +741,7 @@ def _build_clashes_embed(
 
     embed = discord.Embed(
         title=f"Issues — {mode_value.upper()}",
-        description=f"Seite {page + 1}/{total_pages} · {len(issues)} Issues gesamt",
+        description=f"Page {page + 1}/{total_pages} · {len(issues)} issues total",
         color=_MODE_COLORS.get(mode_value, discord.Color.orange()),
     )
     for it in page_issues:
@@ -810,7 +810,7 @@ class ClashesView(discord.ui.View):
             self.mode_value, self.project_id, self.channel_id,
         )
 
-    @discord.ui.button(label="◀ Zurück", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="◀ Back", style=discord.ButtonStyle.secondary)
     async def prev_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
         self.page -= 1
         self._sync_buttons()
@@ -864,7 +864,7 @@ async def clashes(
         return
 
     if not issues:
-        await interaction.followup.send(f"Keine Issues gefunden für Modus **{mode_value}**.")
+        await interaction.followup.send(f"No issues found for mode **{mode_value}**.")
         return
 
     view = ClashesView(issues, per_page, mode_value, project_id, str(interaction.channel_id))
@@ -910,7 +910,7 @@ async def _autocomplete_inbox_issues(
 async def clash_add(interaction: discord.Interaction, issue_id: str):
     db_add_channel_issue(str(interaction.channel_id), issue_id.strip(), str(interaction.user.id))
     await interaction.response.send_message(
-        f"✅ Issue `{issue_id.strip()}` zum Channel-Inbox hinzugefügt.",
+        f"✅ Issue `{issue_id.strip()}` added to this channel's inbox.",
         ephemeral=True,
     )
 
@@ -921,7 +921,7 @@ async def clash_add(interaction: discord.Interaction, issue_id: str):
 async def clash_remove(interaction: discord.Interaction, issue_id: str):
     db_remove_channel_issue(str(interaction.channel_id), issue_id.strip())
     await interaction.response.send_message(
-        f"✅ Issue `{issue_id.strip()}` aus dem Channel-Inbox entfernt.",
+        f"✅ Issue `{issue_id.strip()}` removed from this channel's inbox.",
         ephemeral=True,
     )
 
@@ -980,12 +980,12 @@ async def inbox(interaction: discord.Interaction, limit: int = 10):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@tree.command(name="import_csv", description="Importiere Clashes aus einem Resolve CSV-Export.")
+@tree.command(name="import_csv", description="Import clashes from a Resolve CSV export.")
 @app_commands.guilds(GUILD)
 async def import_csv(interaction: discord.Interaction, file: discord.Attachment):
     if not file.filename.lower().endswith(".csv"):
         await interaction.response.send_message(
-            "⚠️ Bitte eine `.csv` Datei hochladen.", ephemeral=True
+            "⚠️ Please upload a `.csv` file.", ephemeral=True
         )
         return
 
@@ -994,7 +994,7 @@ async def import_csv(interaction: discord.Interaction, file: discord.Attachment)
     try:
         raw = await file.read()
     except Exception as e:
-        await interaction.followup.send(f"⚠️ Datei konnte nicht gelesen werden: `{e}`", ephemeral=True)
+        await interaction.followup.send(f"⚠️ Could not read file: `{e}`", ephemeral=True)
         return
 
     # Try UTF-8 first (with optional BOM), fall back to latin-1
@@ -1005,25 +1005,25 @@ async def import_csv(interaction: discord.Interaction, file: discord.Attachment)
         except UnicodeDecodeError:
             continue
     else:
-        await interaction.followup.send("⚠️ Datei-Encoding konnte nicht erkannt werden.", ephemeral=True)
+        await interaction.followup.send("⚠️ Could not detect file encoding.", ephemeral=True)
         return
 
     try:
         reader = csv.DictReader(io.StringIO(text))
         rows = [r for r in reader if r.get("id", "").strip().isdigit()]
     except Exception as e:
-        await interaction.followup.send(f"⚠️ CSV konnte nicht geparst werden: `{e}`", ephemeral=True)
+        await interaction.followup.send(f"⚠️ Failed to parse CSV: `{e}`", ephemeral=True)
         return
 
     if not rows:
-        await interaction.followup.send("⚠️ Keine gültigen Zeilen in der CSV gefunden.", ephemeral=True)
+        await interaction.followup.send("⚠️ No valid rows found in the CSV.", ephemeral=True)
         return
 
     count = db_upsert_csv_issues(rows)
     log.info("CSV import by %s: %d issues upserted from %s", interaction.user, count, file.filename)
     await interaction.followup.send(
-        f"✅ **{count} Issues** aus `{file.filename}` importiert / aktualisiert.\n"
-        f"Nutze `/clashes` um sie zu sehen.",
+        f"✅ **{count} issues** imported / updated from `{file.filename}`.\n"
+        f"Use `/clashes` to view them.",
         ephemeral=True,
     )
 

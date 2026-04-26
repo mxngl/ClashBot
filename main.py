@@ -21,6 +21,9 @@
 #   OAUTH_PORT (optional, default 8001)
 
 import os
+import csv
+import io
+import re
 import asyncio
 import sqlite3
 import time
@@ -118,6 +121,21 @@ def db_init():
                 added_at INTEGER,
                 PRIMARY KEY (channel_id, issue_id)
             );
+
+            CREATE TABLE IF NOT EXISTS csv_issues (
+                csv_id INTEGER PRIMARY KEY,
+                title TEXT,
+                status TEXT,
+                tags TEXT,
+                creator_name TEXT,
+                created_date TEXT,
+                element_name TEXT,
+                element_revit_id TEXT,
+                marker_x REAL,
+                marker_y REAL,
+                marker_z REAL,
+                imported_at INTEGER
+            );
         """)
 
     if APS_PROJECT_ID_ISSUES_DEFAULT and not db_get_setting("APS_PROJECT_ID_ISSUES"):
@@ -204,6 +222,75 @@ def db_list_issues_added_by(added_by: str) -> set:
             (str(added_by),),
         ).fetchall()
     return {r[0] for r in rows}
+
+
+def db_upsert_csv_issues(rows: list[dict]) -> int:
+    """Insert or replace CSV issues. Returns number of rows processed."""
+    def _safe_float(val: str) -> float | None:
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
+    now = int(time.time())
+    records = []
+    for row in rows:
+        element_name = row.get("element name", "")
+        m = re.search(r"\[(\d+)\]", element_name)
+        element_revit_id = m.group(1) if m else None
+        records.append((
+            int(row["id"]),
+            row.get("text", ""),
+            row.get("status", ""),
+            row.get("tags", ""),
+            row.get("creator name", ""),
+            row.get("created date", ""),
+            element_name,
+            element_revit_id,
+            _safe_float(row.get("markerPosition.x")),
+            _safe_float(row.get("markerPosition.y")),
+            _safe_float(row.get("markerPosition.z")),
+            now,
+        ))
+
+    with get_db() as conn:
+        conn.executemany(
+            """
+            INSERT INTO csv_issues
+                (csv_id, title, status, tags, creator_name, created_date,
+                 element_name, element_revit_id, marker_x, marker_y, marker_z, imported_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(csv_id) DO UPDATE SET
+                title=excluded.title, status=excluded.status, tags=excluded.tags,
+                creator_name=excluded.creator_name, created_date=excluded.created_date,
+                element_name=excluded.element_name, element_revit_id=excluded.element_revit_id,
+                marker_x=excluded.marker_x, marker_y=excluded.marker_y,
+                marker_z=excluded.marker_z, imported_at=excluded.imported_at
+            """,
+            records,
+        )
+    return len(records)
+
+
+def db_get_csv_issues() -> list[dict]:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT csv_id, title, status, tags, creator_name, element_name, element_revit_id "
+            "FROM csv_issues ORDER BY csv_id DESC"
+        ).fetchall()
+    return [
+        {
+            "id": str(r[0]),
+            "title": r[1] or "Untitled",
+            "status": r[2] or "active",
+            "tags": r[3] or "",
+            "creator_name": r[4] or "",
+            "element_name": r[5] or "",
+            "element_revit_id": r[6],
+            "source": "csv",
+        }
+        for r in rows
+    ]
 
 
 # =========================================================
@@ -462,7 +549,8 @@ async def overview(interaction: discord.Interaction):
             "• /link-acc\n"
             "• /acc_hubs\n"
             "• /acc_projects [hub_id]\n"
-            "• /clashes mode:(all|closed|my) limit:10\n"
+            "• /import_csv — Resolve CSV importieren\n"
+            "• /clashes mode:(all|closed|my) per_page:5\n"
             "• /clash_add issue_id:<id>\n"
             "• /clash_remove issue_id:<id>\n"
             "• /inbox\n"
@@ -570,24 +658,47 @@ def _is_closed(status: str | None) -> bool:
     return (status or "").lower() in ["closed", "resolved"]
 
 
+def _normalize_aps_issue(issue: dict) -> dict:
+    push = issue.get("pushpinAttributes") or {}
+    obj_id = push.get("objectId")
+    return {
+        "id": str(issue.get("id", "")),
+        "title": issue.get("title") or "Untitled",
+        "status": issue.get("status") or "—",
+        "source": "acc",
+        "tags": "",
+        "creator_name": "",
+        "element_name": "",
+        "element_revit_id": str(obj_id) if obj_id else None,
+    }
+
+
+def _merge_and_dedup(csv_issues: list[dict], aps_issues: list[dict]) -> list[dict]:
+    """CSV is primary: drop any APS issue whose element_revit_id already exists in CSV."""
+    csv_revit_ids = {i["element_revit_id"] for i in csv_issues if i.get("element_revit_id")}
+    unique_aps = [
+        _normalize_aps_issue(i) for i in aps_issues
+        if (_normalize_aps_issue(i)["element_revit_id"] not in csv_revit_ids)
+    ]
+    return csv_issues + unique_aps
+
+
 async def _load_issues_for_mode(
     project_id: str, mode_value: str, my_issue_ids: set[str]
 ) -> list[dict]:
-    """Fetch and filter issues for the given mode.
+    csv_all = db_get_csv_issues()
 
-    - closed: server-side filter, no post-processing needed
-    - my:     fetch only locally tracked IDs in parallel, filter out closed
-    - all:    fetch a generous batch, filter out closed client-side
-    """
     if mode_value == "closed":
-        return await asyncio.wait_for(
+        csv_closed = [i for i in csv_all if _is_closed(i["status"])]
+        aps_closed = await asyncio.wait_for(
             aps_get_issues(project_id, limit=100, status_filter="closed"),
             timeout=25,
         )
+        return _merge_and_dedup(csv_closed, aps_closed)
 
     if mode_value == "my":
-        if not my_issue_ids:
-            return []
+        csv_my = [i for i in csv_all if i["id"] in my_issue_ids and not _is_closed(i["status"])]
+        aps_my_ids = my_issue_ids - {i["id"] for i in csv_my}
 
         async def _safe_fetch(issue_id: str) -> dict | None:
             try:
@@ -596,15 +707,22 @@ async def _load_issues_for_mode(
                 log.warning("Could not fetch issue %s: %s", issue_id, e)
                 return None
 
-        results = await asyncio.gather(*[_safe_fetch(iid) for iid in my_issue_ids])
-        return [r for r in results if isinstance(r, dict) and not _is_closed(r.get("status"))]
+        if aps_my_ids:
+            results = await asyncio.gather(*[_safe_fetch(iid) for iid in aps_my_ids])
+            aps_my = [r for r in results if isinstance(r, dict) and not _is_closed(r.get("status"))]
+        else:
+            aps_my = []
 
-    # mode: all — fetch open issues
-    issues = await asyncio.wait_for(
+        return _merge_and_dedup(csv_my, aps_my)
+
+    # mode: all — open issues
+    csv_open = [i for i in csv_all if not _is_closed(i["status"])]
+    aps_all = await asyncio.wait_for(
         aps_get_issues(project_id, limit=100),
         timeout=25,
     )
-    return [i for i in issues if not _is_closed(i.get("status"))]
+    aps_open = [i for i in aps_all if not _is_closed(i.get("status"))]
+    return _merge_and_dedup(csv_open, aps_open)
 
 
 def _build_clashes_embed(
@@ -615,23 +733,38 @@ def _build_clashes_embed(
     page_issues = issues[page * per_page : (page + 1) * per_page]
 
     embed = discord.Embed(
-        title=f"ACC Issues — {mode_value.upper()}",
+        title=f"Issues — {mode_value.upper()}",
         description=f"Seite {page + 1}/{total_pages} · {len(issues)} Issues gesamt",
     )
     for it in page_issues:
-        issue_id = str(it.get("id"))
-        title = it.get("title") or "Untitled"
-        status = it.get("status") or "—"
+        issue_id = it["id"]
+        title = it["title"]
+        status = it["status"]
+        source = it.get("source", "acc")
+        tags = it.get("tags", "")
         added_by = db_get_channel_issue_added_by(channel_id, issue_id)
         assignee = f"<@{added_by}>" if added_by else "—"
+
+        source_badge = "**[Resolve]**" if source == "csv" else "**[ACC]**"
+
+        if source == "csv":
+            lines = [
+                f"ID: `{issue_id}`",
+                f"Status: **{status}**",
+                f"Tags: {tags}" if tags else None,
+                f"Assignee: {assignee}",
+            ]
+        else:
+            lines = [
+                f"ID: `{issue_id}`",
+                f"Status: **{status}**",
+                f"Assignee: {assignee}",
+                f"[Open in ACC]({build_acc_issue_url(project_id, issue_id)})",
+            ]
+
         embed.add_field(
-            name=str(title)[:80],
-            value=(
-                f"ID: `{issue_id}`\n"
-                f"Status: **{status}**\n"
-                f"Assignee: {assignee}\n"
-                f"[Open in ACC]({build_acc_issue_url(project_id, issue_id)})"
-            ),
+            name=f"{source_badge} {str(title)[:75]}",
+            value="\n".join(l for l in lines if l is not None),
             inline=False,
         )
     return embed
@@ -802,6 +935,54 @@ async def inbox(interaction: discord.Interaction, limit: int = 10):
         )
 
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="import_csv", description="Importiere Clashes aus einem Resolve CSV-Export.")
+@app_commands.guilds(GUILD)
+async def import_csv(interaction: discord.Interaction, file: discord.Attachment):
+    if not file.filename.lower().endswith(".csv"):
+        await interaction.response.send_message(
+            "⚠️ Bitte eine `.csv` Datei hochladen.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        raw = await file.read()
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Datei konnte nicht gelesen werden: `{e}`", ephemeral=True)
+        return
+
+    # Try UTF-8 first (with optional BOM), fall back to latin-1
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            text = raw.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        await interaction.followup.send("⚠️ Datei-Encoding konnte nicht erkannt werden.", ephemeral=True)
+        return
+
+    try:
+        reader = csv.DictReader(io.StringIO(text))
+        rows = [r for r in reader if r.get("id", "").strip().isdigit()]
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ CSV konnte nicht geparst werden: `{e}`", ephemeral=True)
+        return
+
+    if not rows:
+        await interaction.followup.send("⚠️ Keine gültigen Zeilen in der CSV gefunden.", ephemeral=True)
+        return
+
+    count = db_upsert_csv_issues(rows)
+    log.info("CSV import by %s: %d issues upserted from %s", interaction.user, count, file.filename)
+    await interaction.followup.send(
+        f"✅ **{count} Issues** aus `{file.filename}` importiert / aktualisiert.\n"
+        f"Nutze `/clashes` um sie zu sehen.",
+        ephemeral=True,
+    )
 
 
 @tree.error

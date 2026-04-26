@@ -24,6 +24,7 @@ import os
 import asyncio
 import sqlite3
 import time
+import secrets
 import logging
 import contextlib
 from contextlib import contextmanager
@@ -56,6 +57,11 @@ APS_PROJECT_ID_ISSUES_DEFAULT = os.getenv("APS_PROJECT_ID_ISSUES")
 GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", "0"))
 
 DB_PATH = "bot.db"
+
+# Short-lived OAuth states: {state: (discord_user_id, expires_at)}
+_pending_states: dict[str, tuple[str, float]] = {}
+# Reference to the Discord bot's event loop, set in run()
+_main_loop: asyncio.AbstractEventLoop | None = None
 
 APS_AUTH_URL = "https://developer.api.autodesk.com/authentication/v2/authorize"
 APS_TOKEN_URL = "https://developer.api.autodesk.com/authentication/v2/token"
@@ -205,12 +211,29 @@ def db_list_issues_added_by(added_by: str) -> set:
 # =========================================================
 
 
-def build_auth_url() -> str:
+def create_oauth_state(discord_user_id: str) -> str:
+    """Generate a one-time state token tied to a Discord user, valid for 10 minutes."""
+    state = secrets.token_urlsafe(24)
+    _pending_states[state] = (str(discord_user_id), time.time() + 600)
+    return state
+
+
+def consume_oauth_state(state: str) -> str | None:
+    """Return the Discord user ID for a valid state and remove it, or None if invalid/expired."""
+    entry = _pending_states.pop(state, None)
+    if entry is None:
+        return None
+    discord_user_id, expires_at = entry
+    return discord_user_id if time.time() < expires_at else None
+
+
+def build_auth_url(state: str) -> str:
     return APS_AUTH_URL + "?" + urlencode({
         "response_type": "code",
         "client_id": APS_CLIENT_ID or "",
         "redirect_uri": APS_REDIRECT_URI or "",
         "scope": APS_SCOPES,
+        "state": state,
     })
 
 
@@ -327,9 +350,22 @@ def build_acc_issue_url(project_id: str, issue_id: str) -> str:
 app = FastAPI()
 
 
+async def _notify_linked(discord_user_id: str) -> None:
+    """DM the user who triggered /link-acc that their ACC is now connected."""
+    try:
+        user = await client.fetch_user(int(discord_user_id))
+        await user.send(
+            "✅ **ACC erfolgreich verbunden!**\n"
+            "Du kannst den Bot jetzt mit `/clashes`, `/inbox` und `/clash_add` nutzen."
+        )
+    except Exception as e:
+        log.warning("Could not DM user %s after OAuth: %s", discord_user_id, e)
+
+
 @app.get("/oauth/callback")
 async def oauth_callback(request: Request):
     code = request.query_params.get("code")
+    state = request.query_params.get("state")
     if not code:
         return {"ok": False, "error": "missing_code"}
 
@@ -337,7 +373,15 @@ async def oauth_callback(request: Request):
     expires_at = int(time.time()) + int(token.get("expires_in", 3600))
     db_set_tokens(token["access_token"], token["refresh_token"], expires_at)
     log.info("OAuth tokens stored successfully.")
-    return {"ok": True}
+
+    discord_user_id = consume_oauth_state(state) if state else None
+    if discord_user_id and _main_loop:
+        asyncio.run_coroutine_threadsafe(
+            _notify_linked(discord_user_id),
+            _main_loop,
+        )
+
+    return {"ok": True, "message": "ACC connected. You can close this tab."}
 
 
 # =========================================================
@@ -426,6 +470,17 @@ async def overview(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+class OAuthView(discord.ui.View):
+    def __init__(self, url: str):
+        super().__init__()
+        self.add_item(discord.ui.Button(
+            label="Connect ACC",
+            url=url,
+            style=discord.ButtonStyle.link,
+            emoji="🔗",
+        ))
+
+
 @tree.command(name="link-acc", description="Connect your Autodesk ACC account (OAuth).")
 @app_commands.guilds(GUILD)
 async def link_acc(interaction: discord.Interaction):
@@ -438,12 +493,19 @@ async def link_acc(interaction: discord.Interaction):
         )
         return
 
-    url = build_auth_url()
-    await interaction.followup.send(
-        f"Open this link to connect ACC (3-legged OAuth):\n{url}\n\n"
-        "After login, ACC will redirect to your callback URL and the bot will store tokens in bot.db.",
-        ephemeral=True,
+    state = create_oauth_state(str(interaction.user.id))
+    url = build_auth_url(state)
+
+    embed = discord.Embed(
+        title="Connect Autodesk ACC",
+        description=(
+            "Klick den Button unten um dich mit deinem Autodesk-Konto zu verbinden.\n\n"
+            "Nach dem Login bekommst du eine DM von mir zur Bestätigung.\n"
+            "Der Link ist **10 Minuten** gültig."
+        ),
+        color=discord.Color.orange(),
     )
+    await interaction.followup.send(embed=embed, view=OAuthView(url), ephemeral=True)
 
 
 @tree.command(name="acc_hubs", description="List available ACC/BIM360 hubs.")
@@ -684,6 +746,8 @@ def _start_web_server():
 
 
 async def run():
+    global _main_loop
+    _main_loop = asyncio.get_running_loop()
     db_init()
 
     web_task = asyncio.create_task(asyncio.to_thread(_start_web_server))

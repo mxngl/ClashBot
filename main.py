@@ -725,6 +725,13 @@ async def _load_issues_for_mode(
     return _merge_and_dedup(csv_open, aps_open)
 
 
+_MODE_COLORS = {
+    "all":    discord.Color.orange(),
+    "my":     discord.Color.blue(),
+    "closed": discord.Color.from_rgb(120, 120, 120),
+}
+
+
 def _build_clashes_embed(
     issues: list[dict], page: int, per_page: int, mode_value: str,
     project_id: str, channel_id: str,
@@ -735,6 +742,7 @@ def _build_clashes_embed(
     embed = discord.Embed(
         title=f"Issues — {mode_value.upper()}",
         description=f"Seite {page + 1}/{total_pages} · {len(issues)} Issues gesamt",
+        color=_MODE_COLORS.get(mode_value, discord.Color.orange()),
     )
     for it in page_issues:
         issue_id = it["id"]
@@ -863,22 +871,57 @@ async def clashes(
     await interaction.followup.send(embed=view._embed(), view=view)
 
 
-@tree.command(name="clash_add", description="Save an ACC issue id to this channel's inbox.")
+async def _autocomplete_all_issues(
+    _interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Autocomplete from CSV issues (DB, instant) filtered by current input."""
+    issues = db_get_csv_issues()
+    current_lower = current.lower()
+    matches = [
+        i for i in issues
+        if current_lower in i["title"].lower() or current in i["id"]
+    ]
+    return [
+        app_commands.Choice(name=f"[{i['id']}] {i['title'][:80]}", value=i["id"])
+        for i in matches[:25]
+    ]
+
+
+async def _autocomplete_inbox_issues(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Autocomplete from issues already in this channel's inbox."""
+    rows = db_list_channel_issues(str(interaction.channel_id))
+    csv_by_id = {i["id"]: i for i in db_get_csv_issues()}
+    current_lower = current.lower()
+    choices = []
+    for issue_id, _added_by, _added_at in rows:
+        title = csv_by_id[issue_id]["title"] if issue_id in csv_by_id else issue_id
+        if current_lower in title.lower() or current in issue_id:
+            choices.append(app_commands.Choice(name=f"[{issue_id}] {title[:80]}", value=issue_id))
+        if len(choices) == 25:
+            break
+    return choices
+
+
+@tree.command(name="clash_add", description="Save an issue to this channel's inbox.")
 @app_commands.guilds(GUILD)
+@app_commands.autocomplete(issue_id=_autocomplete_all_issues)
 async def clash_add(interaction: discord.Interaction, issue_id: str):
     db_add_channel_issue(str(interaction.channel_id), issue_id.strip(), str(interaction.user.id))
     await interaction.response.send_message(
-        f"✅ Added issue `{issue_id.strip()}` to this channel inbox.",
+        f"✅ Issue `{issue_id.strip()}` zum Channel-Inbox hinzugefügt.",
         ephemeral=True,
     )
 
 
-@tree.command(name="clash_remove", description="Remove an issue id from this channel's inbox.")
+@tree.command(name="clash_remove", description="Remove an issue from this channel's inbox.")
 @app_commands.guilds(GUILD)
+@app_commands.autocomplete(issue_id=_autocomplete_inbox_issues)
 async def clash_remove(interaction: discord.Interaction, issue_id: str):
     db_remove_channel_issue(str(interaction.channel_id), issue_id.strip())
     await interaction.response.send_message(
-        f"✅ Removed issue `{issue_id.strip()}` from this channel inbox.",
+        f"✅ Issue `{issue_id.strip()}` aus dem Channel-Inbox entfernt.",
         ephemeral=True,
     )
 

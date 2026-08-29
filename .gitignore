@@ -11,3 +11,6 @@ bot.db
 __pycache__/
 *.pyc
 *.pyo
+
+# Commands for personal use
+commands.txt
